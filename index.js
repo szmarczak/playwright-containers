@@ -179,6 +179,9 @@ const limit = (fn) => {
 // - a target is created, but before any requests are made (in order to set up container environent such as document.cookie, localStorage, etc.).
 // - a target is closed (in order to clean up containers).
 
+// We can use https://chromedevtools.github.io/devtools-protocol/tot/DOMStorage/ for storage cleanup.
+// Storages (perhaps cookies as well?) can be resized: https://chromedevtools.github.io/devtools-protocol/tot/Storage/#method-overrideQuotaForOrigin
+
 (async () => {
 	const browser = await playwright.chromium.launchPersistentContext('', {
 		headless: false,
