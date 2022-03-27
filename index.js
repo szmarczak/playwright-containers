@@ -2,8 +2,9 @@
 const fs = require('fs');
 const playwright = require('playwright');
 
-// Playwright is not supported due to https://github.com/microsoft/playwright/issues/7220 (cache disabled if intercepting)
-// Also please see https://github.com/microsoft/playwright/issues/6319
+// Potential issues:
+// - https://github.com/microsoft/playwright/issues/6319 (ram usage keeps increasing)
+// - https://github.com/microsoft/playwright/issues/4488 (cannot intercept websockets so we may get detected, workaround: use incognito contexts)
 
 const container = fs.readFileSync('container.js', 'utf8');
 
@@ -149,88 +150,154 @@ const registerContainerId = async (context) => {
 	context.on('page', onPage);
 };
 
-const normalizeCookie = (cookie) => {
-	cookie = cookie.trimStart();
+// Limit an asynchronous function to be executed only once at a time
+const limit = (fn) => {
+	let prev = Promise.resolve();
 
-	const delimiterIndex = cookie.indexOf(';');
-	const equalsIndex = cookie.indexOf('=');
+	return (...args) => {
+		let resolve;
+		let reject;
+		const promise = new Promise((_resolve, _reject) => {
+			resolve = _resolve;
+			reject = _reject;
+		});
 
-	if ((equalsIndex === -1) || ((delimiterIndex !== -1) && (equalsIndex > delimiterIndex))) {
-		cookie = '=' + cookie;
-	}
-
-	return cookie;
-};
-
-const registerCookieTransfomer = async (context) => {
-	// It doesn't intercept requests from service workers. Bug? Feature?
-	// See https://github.com/microsoft/playwright/issues/1090
-	await context.route('**/*', async (route, request) => {
-		// it's very easy to crash if websites abuse this.
-		// if (request.url().endsWith('pleaseNoIntercept')) {
-		// 	return;
-		// }
-
-		const cid = containerId.get(request.frame().page());
-
-		if (!cid) {
-			return;
-		}
-
-		const prefix = 'apify.container.' + cid + '.';
-
-		const headers = request.headers();
-		const cookie = headers.cookie;
-
-		if (cookie) {
-			const parsedCookies = cookie.split('; ');
-			const filteredCookies = parsedCookies.filter(cookie => cookie.startsWith(prefix));
-			const mappedCookies = filteredCookies.map(cookie => cookie.slice(prefix.length));
-
-			headers.cookie = mappedCookies.join('; ');
-		}
-
-		try {
-			const requestContext = await playwright.request.newContext();
-			const response = await requestContext.fetch(route.request(), { headers });
-
-			const responseHeaders = response.headers();
-
-			const setCookie = responseHeaders['set-cookie'];
-			if (setCookie) {
-				responseHeaders['set-cookie'] = setCookie.split('\n').map(cookie => prefix + normalizeCookie(cookie)).join('\n');
-			}
-
-			route.fulfill({
-				response,
-				headers: responseHeaders,
+		prev.finally(() => {
+			queueMicrotask(() => {
+				fn(...args).then(resolve, reject);
 			});
-		} catch (error) {
-			 console.error(error);
-			route.abort('failed');
-		}
-	});
+		});
+
+		prev = promise;
+
+		return promise;
+	};
 };
 
-const useContainers = async (context) => {
-	await registerContainerId(context);
-	await registerCookieTransfomer(context);
-};
+// What we are missing is target interception.
+// We want to to send CDP messages when:
+// - a target is created, but before any requests are made (in order to set up container environent such as document.cookie, localStorage, etc.).
+// - a target is closed (in order to clean up containers).
 
 (async () => {
 	const browser = await playwright.chromium.launchPersistentContext('', {
 		headless: false,
 	});
 
-	await useContainers(browser);
-
 	const open = async (url = 'https://www.google.com') => {
 		const page = await browser.newPage();
+
+		const id = 'asdf';
+		const prefix = 'apify.container.' + id + '.';
+
+		const source = '(() => {' + 'let key = "' + id + '";\n' + container + '})();';
+
+		const cdp = await page.context().newCDPSession(page);
+		await cdp.send('Fetch.enable');
+		// await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source });
+		// await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: 'alert(1)' });
+
+		const requestHandler = async (data) => {
+			let cookies;
+
+			const handleResponse = async () => {
+				// Get cookies for this URL
+				cookies = (await cdp.send('Network.getCookies', { urls: [ data.request.url ] })).cookies;
+
+				// Get new cookies
+				cookies = cookies.filter(cookie => !cookie.name.startsWith('apify.container.'));
+
+				// Remove those cookies
+				await Promise.allSettled(cookies.map(cookie => cdp.send('Network.deleteCookies', cookie)));
+
+				// Update cookie names
+				for (const cookie of cookies) {
+					cookie.name = prefix + cookie.name;
+				}
+
+				// Set updated cookies
+				await cdp.send('Network.setCookies', { cookies });
+
+				// Resume response
+				await cdp.send('Fetch.continueResponse', {
+					requestId: data.requestId,
+					responseCode: data.responseStatusCode,
+					responseHeaders: [],
+				});
+			};
+
+			const handleRequest = async () => {
+				// Get cookies for this URL
+				cookies = (await cdp.send('Network.getCookies', { urls: [ data.request.url ] })).cookies;
+
+				// Get cookies unassociated with this instance
+				const cookiesToRemove = cookies.filter(cookie => !cookie.name.startsWith(prefix));
+
+				// Get cookies associated with this instance
+				const cookiesToSet = cookies.filter(cookie => cookie.name.startsWith(prefix));
+
+				// Remove cookies unassociated with this instance
+				await Promise.allSettled(cookiesToRemove.map(cookie => cdp.send('Network.deleteCookies', cookie)));
+
+				// Slice cookie names associated with this instance
+				for (const cookie of cookiesToSet) {
+					cookie.name = cookie.name.slice(prefix.length);
+				}
+
+				// Set unwrapped cookies
+				await cdp.send('Network.setCookies', { cookies: cookiesToSet });
+
+				// Continue the request
+				await cdp.send('Fetch.continueRequest', {
+					requestId: data.requestId,
+					interceptResponse: true,
+				});
+
+				// Remove unwrapped cookies
+				await Promise.allSettled(cookiesToSet.map(cookie => cdp.send('Network.deleteCookies', cookie)));
+
+				// Restore deleted cookies
+				await cdp.send('Network.setCookies', { cookies: cookiesToRemove });
+
+				// Restore wrapped cookies
+				for (const cookie of cookiesToSet) {
+					cookie.name = prefix + cookie.name;
+				}
+				await cdp.send('Network.setCookies', { cookies: cookiesToSet });
+			};
+
+			// If response status code is defined, then it's a response.
+			if (data.responseStatusCode) {
+				await handleResponse();
+			} else {
+				await handleRequest();
+			}
+		};
+
+		const safeRequestHandler = async (...args) => {
+			const messages = [
+				'Invalid InterceptionId',
+				'Target closed',
+				'Target page, context or browser has been closed',
+			];
+
+			try {
+				await requestHandler(...args);
+			} catch (error) {
+				if (!messages.some(message => error.message.includes(message))) {
+					throw error;
+				}
+			}
+		};
+
+		// https://chromedevtools.github.io/devtools-protocol/tot/Fetch/#event-requestPaused
+		// Limit concurrency to 1 in order to prevent races
+		cdp.on('Fetch.requestPaused', limit(safeRequestHandler));
+
 		await page.goto(url);
 
 		return page;
 	};
 
-	const pages = await Promise.all([ open(), open() ]);
+	const pages = await Promise.all([ open(), /*open()*/ ]);
 })();
-
