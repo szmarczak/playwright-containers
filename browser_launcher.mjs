@@ -116,7 +116,6 @@ export default async (path, userArgs = []) => {
     const browserProcess = child_process.spawn(path, args, {
         stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
         detached: false,
-        serialization: 'json',
     });
     browserProcess.stdout.resume();
     browserProcess.stderr.resume();
